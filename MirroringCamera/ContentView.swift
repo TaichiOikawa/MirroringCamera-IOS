@@ -12,17 +12,16 @@ struct ContentView: View {
   var body: some View {
     GeometryReader { geometry in
       let isLandscape = geometry.size.width > geometry.size.height
+      let previewSize = cameraPreviewSize(in: geometry, isLandscape: isLandscape)
+      let targetAspect: CGFloat = isLandscape ? (16.0 / 9.0) : (9.0 / 16.0)
 
       ZStack {
         Color.black.edgesIgnoringSafeArea(.all)
 
         // カメラプレビューは常に1つだけ（if/else の外に置いて再生成を防止）
         CameraView(isScreenLocked: $isScreenLocked)
-          .aspectRatio(isLandscape ? 16.0 / 9.0 : 9.0 / 16.0, contentMode: isLandscape ? .fill : .fit)
-          .frame(
-            width: isLandscape ? geometry.size.width - 240 : nil,
-            height: isLandscape ? geometry.size.height : nil
-          )
+          .aspectRatio(targetAspect, contentMode: .fit)
+          .frame(width: previewSize.width, height: previewSize.height)
           .clipped()
           .position(
             x: geometry.size.width / 2,
@@ -476,5 +475,22 @@ struct ContentView: View {
         CameraManager.shared.coordinator?.refreshPreviewOrientation()
       }
     }
+  }
+
+  // MARK: - プレビューサイズ
+  private func cameraPreviewSize(in geometry: GeometryProxy, isLandscape: Bool) -> CGSize {
+    let targetAspect: CGFloat = isLandscape ? (16.0 / 9.0) : (9.0 / 16.0)
+
+    // 縦横とも全画面の中でアスペクト比を維持し、UIはその上に重ねる。
+    let availableWidth = geometry.size.width
+    let availableHeight = geometry.size.height
+
+    let widthFromHeight = availableHeight * targetAspect
+    if widthFromHeight <= availableWidth {
+      return CGSize(width: widthFromHeight, height: availableHeight)
+    }
+
+    let heightFromWidth = availableWidth / targetAspect
+    return CGSize(width: availableWidth, height: heightFromWidth)
   }
 }
