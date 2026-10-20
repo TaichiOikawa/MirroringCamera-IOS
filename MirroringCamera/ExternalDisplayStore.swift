@@ -19,6 +19,14 @@ final class ExternalDisplayStore: ObservableObject {
     private let outputDelegate = VideoOutputDelegate()
     private weak var session: AVCaptureSession?
     private weak var pendingView: ExternalCameraView?
+    private var subscriptions = Set<AnyCancellable>()
+
+    private init() {
+        SettingsStore.shared.$previewInterval.combineLatest(WebSocketManager.shared.$isConnected)
+            .sink { [weak self] interval, connected in
+                self?.outputDelegate.configurePreview(enabled: connected, interval: interval)
+            }.store(in: &subscriptions)
+    }
 
     /// カメラセッションを設定（CameraView側から呼び出す）
     func setSession(_ session: AVCaptureSession) {
@@ -41,6 +49,7 @@ final class ExternalDisplayStore: ObservableObject {
 
         let output = AVCaptureVideoDataOutput()
         output.alwaysDiscardsLateVideoFrames = true
+        output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
         output.setSampleBufferDelegate(outputDelegate, queue: outputQueue)
 
         session.beginConfiguration()
@@ -86,8 +95,16 @@ final class ExternalDisplayStore: ObservableObject {
         pendingView = nil
     }
 
+    func startQRScanning(_ scanner: QRFrameScanner) {
+        outputDelegate.setQRScanner(scanner)
+    }
+
+    func stopQRScanning(_ scanner: QRFrameScanner) {
+        outputDelegate.removeQRScanner(scanner)
+    }
+
     /// 現在のデバイス向きをコネクションに適用
-    nonisolated static func applyCurrentOrientation(to connection: AVCaptureConnection) {
+    static func applyCurrentOrientation(to connection: AVCaptureConnection) {
         let deviceOrientation = UIDevice.current.orientation
         if #available(iOS 17.0, *) {
             let angle: CGFloat
@@ -146,8 +163,35 @@ private class VideoOutputDelegate: NSObject, AVCaptureVideoDataOutputSampleBuffe
     var isScreenLocked = false
 
     /// プレビュー送信用のスロットリング
-    private var lastPreviewSentAt: Date = .distantPast
-    private let previewQueue = DispatchQueue(label: "com.mirroringcamera.previewCapture")
+    private var lastPreviewSentAt: TimeInterval = -.infinity
+    private let imageContext = CIContext()
+    private let settingsLock = NSLock()
+    private var fallbackInterval: TimeInterval = 1
+    private var previewEnabled = false
+    private var previewGeneration: UInt64 = 0
+    private var qrScanner: QRFrameScanner?
+
+    func setQRScanner(_ scanner: QRFrameScanner) {
+        settingsLock.lock()
+        let previous = qrScanner
+        qrScanner = scanner
+        settingsLock.unlock()
+        previous?.stop()
+    }
+
+    func removeQRScanner(_ scanner: QRFrameScanner) {
+        settingsLock.lock()
+        if qrScanner === scanner { qrScanner = nil }
+        settingsLock.unlock()
+    }
+
+    func configurePreview(enabled: Bool, interval: TimeInterval) {
+        settingsLock.lock()
+        previewGeneration &+= 1
+        previewEnabled = enabled
+        fallbackInterval = interval
+        settingsLock.unlock()
+    }
 
     func captureOutput(
         _ output: AVCaptureOutput,
@@ -162,24 +206,42 @@ private class VideoOutputDelegate: NSObject, AVCaptureVideoDataOutputSampleBuffe
             layer.enqueue(sampleBuffer)
         }
 
-        // WebSocket プレビュー送信（設定された間隔）
-        let now = Date()
-        let interval = SettingsStore.shared.previewInterval
-        guard now.timeIntervalSince(lastPreviewSentAt) >= interval else { return }
+        settingsLock.lock()
+        let scanner = qrScanner
+        settingsLock.unlock()
+        scanner?.consume(sampleBuffer)
+
+        WebRTCManager.shared.pushFrame(sampleBuffer)
+
+        settingsLock.lock()
+        let enabled = previewEnabled
+        let interval = fallbackInterval
+        let generation = previewGeneration
+        settingsLock.unlock()
+        guard enabled, WebRTCManager.shared.isFallbackActive else { return }
+
+        // JPEG covers unavailable viewers even when another viewer is connected.
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastPreviewSentAt >= interval else { return }
         lastPreviewSentAt = now
 
-        previewQueue.async {
-            guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-            let ciImage = CIImage(cvPixelBuffer: imageBuffer)
-            let context = CIContext()
-            guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else { return }
-            let uiImage = UIImage(cgImage: cgImage)
-            // 低画質 JPEG
-            guard let jpegData = uiImage.jpegData(compressionQuality: 0.3) else { return }
-            DispatchQueue.main.async {
-                WebSocketManager.shared.sendPreview(imageData: jpegData)
-            }
+        guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let image = CIImage(cvPixelBuffer: imageBuffer)
+        let scale = min(1, 640 / max(image.extent.width, image.extent.height))
+        let scaled = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        guard let cgImage = imageContext.createCGImage(scaled, from: scaled.extent),
+              let jpegData = UIImage(cgImage: cgImage).jpegData(compressionQuality: 0.3) else { return }
+        Task { @MainActor in
+            // A connection can recover while the frame is being encoded.
+            guard self.isCurrentPreview(generation), WebRTCManager.shared.isFallbackActive else { return }
+            WebSocketManager.shared.sendPreview(imageData: jpegData)
         }
+    }
+
+    private func isCurrentPreview(_ generation: UInt64) -> Bool {
+        settingsLock.lock()
+        defer { settingsLock.unlock() }
+        return previewEnabled && previewGeneration == generation
     }
 
     @objc func orientationDidChange() {
@@ -190,6 +252,8 @@ private class VideoOutputDelegate: NSObject, AVCaptureVideoDataOutputSampleBuffe
         guard orientation == .portrait || orientation == .portraitUpsideDown
            || orientation == .landscapeLeft || orientation == .landscapeRight else { return }
         guard let connection = videoOutput?.connection(with: .video) else { return }
-        ExternalDisplayStore.applyCurrentOrientation(to: connection)
+        Task { @MainActor in
+            ExternalDisplayStore.applyCurrentOrientation(to: connection)
+        }
     }
 }

@@ -109,20 +109,19 @@ struct CameraView: UIViewRepresentable {
     view.layer.addSublayer(previewLayer)
     view.previewLayer = previewLayer
 
-    DispatchQueue.global(qos: .userInitiated).async {
-      session.startRunning()
-
-      DispatchQueue.main.async {
-        coordinator.updateOutputConnections()
-        view.setupPreviewLayerOrientation()
-      }
-    }
-
     coordinator.session = session
 
-    // 外部ディスプレイ用にセッションを共有
+    // Configure the shared data output before startRunning; these operations must not overlap.
     Task { @MainActor in
       ExternalDisplayStore.shared.setSession(session)
+      let start = DispatchWorkItem {
+        session.startRunning()
+        DispatchQueue.main.async {
+          coordinator.updateOutputConnections()
+          view.setupPreviewLayerOrientation()
+        }
+      }
+      DispatchQueue.global(qos: .userInitiated).async(execute: start)
     }
   }
 

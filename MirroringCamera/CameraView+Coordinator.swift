@@ -6,6 +6,7 @@ extension CameraView {
   class Coordinator: NSObject, AVCaptureFileOutputRecordingDelegate, AVCapturePhotoCaptureDelegate,
     CameraCoordinatorProtocol
   {
+    var captureSession: AVCaptureSession? { session }
     var session: AVCaptureSession?
     var movieOutput: AVCaptureMovieFileOutput?
     var photoOutput: AVCapturePhotoOutput?

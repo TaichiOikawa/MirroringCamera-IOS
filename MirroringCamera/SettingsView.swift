@@ -6,12 +6,24 @@ struct SettingsView: View {
     @ObservedObject private var settings = SettingsStore.shared
     @ObservedObject private var wsManager = WebSocketManager.shared
 
+    @State private var showQRScanner = false
+    @ObservedObject private var cameraManager = CameraManager.shared
+
     @State private var editingURL: String = ""
     @State private var editingAPIKey: String = ""
 
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    Button { showQRScanner = true } label: {
+                        Label("QRコードで接続", systemImage: "qrcode.viewfinder")
+                    }
+                    .disabled(cameraManager.isRecording || cameraManager.isTimeLapseActive)
+                } footer: {
+                    Text("CameraControllerのQRコードから接続情報を設定します。録画・タイムラプスを停止してからご利用ください。")
+                }
+
                 // MARK: - サーバー設定
                 Section {
                     TextField("URL", text: $editingURL)
@@ -105,7 +117,7 @@ struct SettingsView: View {
                 } header: {
                     Text("プレビュー送信")
                 } footer: {
-                    Text("サーバーへのプレビュー画像の送信間隔を設定します")
+                    Text("WebRTCで接続できない場合のプレビュー画像の送信間隔を設定します")
                 }
 
                 // MARK: - カメラ情報
@@ -178,6 +190,15 @@ struct SettingsView: View {
                     }
                 }
             }
+            .sheet(isPresented: $showQRScanner) {
+                QRScannerView { credentials in
+                    wsManager.disconnect()
+                    settings.applyPairing(credentials)
+                    editingURL = settings.apiBaseURL
+                    editingAPIKey = settings.apiKey
+                    wsManager.connect()
+                }
+            }
             .onAppear {
                 editingURL = settings.apiBaseURL
                 editingAPIKey = settings.apiKey
@@ -187,13 +208,17 @@ struct SettingsView: View {
 
     private func saveSettings() {
         let trimmedURL = editingURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = editingAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let changed = settings.apiBaseURL != trimmedURL || settings.apiKey != trimmedKey
+        let reconnect = changed && (wsManager.isConnected || wsManager.isConnecting)
+        if reconnect { wsManager.disconnect() }
         if settings.apiBaseURL != trimmedURL {
             settings.apiBaseURL = trimmedURL
         }
-        let trimmedKey = editingAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if settings.apiKey != trimmedKey {
             settings.apiKey = trimmedKey
         }
+        if reconnect { wsManager.connect() }
     }
 
     private var batteryText: String {

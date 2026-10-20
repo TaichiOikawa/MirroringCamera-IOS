@@ -11,188 +11,193 @@ final class WebSocketManager: ObservableObject {
     @Published var lastError: String?
     @Published var isActiveCamera = false
 
+    private let settings: SettingsStore
+    private let registrationSession: URLSession
     private var webSocketTask: URLSessionWebSocketTask?
     private var session: URLSession?
+    private var registrationTask: URLSessionDataTask?
     private var statusTimer: Timer?
     private var pingTimer: Timer?
     private var reconnectTimer: Timer?
     private var isIntentionalDisconnect = false
     private var reconnectAttempts = 0
     private let maxReconnectAttempts = 5
+    private var connectionGeneration: UInt64 = 0
 
-    private init() {
+    init(settings: SettingsStore = .shared, registrationSession: URLSession = .shared) {
+        self.settings = settings
+        self.registrationSession = registrationSession
         UIDevice.current.isBatteryMonitoringEnabled = true
+        _ = NetworkMonitor.shared
     }
 
-    // MARK: - 接続管理
-
     func connect() {
-        guard SettingsStore.shared.isConfigured else {
-            lastError = "API URL または API Key が設定されていません"
+        guard !isConnected, !isConnecting else { return }
+        guard settings.isConfigured, settings.wsURL != nil else {
+            lastError = "有効なAPI URLとAPI Keyを設定してください"
             return
         }
+        stopTimers()
+        connectionGeneration &+= 1
+        let generation = connectionGeneration
         isIntentionalDisconnect = false
         reconnectAttempts = 0
         isConnecting = true
-        registerCamera { [weak self] success in
-            guard let self else { return }
-            if success {
-                self.openWebSocket()
-            } else {
-                // 登録失敗でもWebSocket接続を試みる（既に登録済みの場合もある）
-                self.openWebSocket()
-            }
-        }
+        lastError = nil
+        registerCamera(generation: generation)
     }
 
     func disconnect() {
         isIntentionalDisconnect = true
+        connectionGeneration &+= 1
         stopTimers()
-        webSocketTask?.cancel(with: .normalClosure, reason: nil)
-        webSocketTask = nil
+        releaseConnection()
         isConnected = false
         isConnecting = false
         isActiveCamera = false
+        lastError = nil
     }
 
-    // MARK: - カメラ登録 (REST)
+    func onForegroundResume() {
+        guard !isIntentionalDisconnect, settings.isConfigured,
+              !isConnected, !isConnecting else { return }
+        connect()
+    }
 
-    private func registerCamera(completion: @escaping (Bool) -> Void) {
-        guard let baseURL = SettingsStore.shared.restBaseURL else {
-            completion(false)
+    private func releaseConnection() {
+        registrationTask?.cancel()
+        registrationTask = nil
+        webSocketTask?.cancel(with: .normalClosure, reason: nil)
+        webSocketTask = nil
+        session?.invalidateAndCancel()
+        session = nil
+        WebRTCManager.shared.closeAll()
+    }
+
+    private func registerCamera(generation: UInt64) {
+        guard let baseURL = settings.restBaseURL else {
+            isConnecting = false
+            lastError = "API URLが不正です"
             return
         }
-        let url = baseURL.appendingPathComponent("/api/cameras/register")
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: baseURL.appendingPathComponent("api/cameras/register"))
         request.httpMethod = "POST"
+        request.timeoutInterval = 15
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-
-        // API Key 認証ヘッダー
-        let apiKey = SettingsStore.shared.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !apiKey.isEmpty {
-            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer " + settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines),
+                         forHTTPHeaderField: "Authorization")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["camera_id": settings.cameraID])
+        registrationTask = registrationSession.dataTask(with: request) { [weak self] _, _, _ in
+            Task { @MainActor in
+                guard let self, self.connectionGeneration == generation, !self.isIntentionalDisconnect else { return }
+                self.registrationTask = nil
+                // Already registered cameras can still connect if registration fails.
+                self.openWebSocket(expectedGeneration: generation)
+            }
         }
+        registrationTask?.resume()
+    }
 
-        let body: [String: Any] = [
-            "camera_id": SettingsStore.shared.cameraID
-        ]
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-
-        URLSession.shared.dataTask(with: request) { data, response, error in
+    private func openWebSocket(expectedGeneration: UInt64) {
+        guard connectionGeneration == expectedGeneration, !isIntentionalDisconnect else { return }
+        guard let url = settings.wsURL else {
+            isConnecting = false
+            lastError = "WebSocket URLの構築に失敗しました"
+            return
+        }
+        connectionGeneration &+= 1
+        let generation = connectionGeneration
+        let urlSession = URLSession(configuration: .default)
+        session = urlSession
+        let task = urlSession.webSocketTask(with: url)
+        webSocketTask = task
+        isConnecting = true
+        WebRTCManager.shared.configureSignaling { [weak self] payload in
+            // Preserve offer/ICE ordering when hopping to the signaling socket.
             DispatchQueue.main.async {
-                if let error = error {
-                    print("カメラ登録エラー: \(error.localizedDescription)")
-                    self.lastError = "カメラ登録失敗: \(error.localizedDescription)"
-                    completion(false)
+                guard let self, self.connectionGeneration == generation else { return }
+                self.sendJSON(payload)
+            }
+        }
+        task.resume()
+        receiveMessage(task: task, generation: generation)
+        startPingTimer(task: task, generation: generation)
+        guard let data = try? JSONSerialization.data(withJSONObject: buildStatusPayload()),
+              let json = String(data: data, encoding: .utf8) else { return }
+        task.send(.string(json)) { [weak self] error in
+            Task { @MainActor in
+                guard let self, self.isCurrent(task, generation: generation) else { return }
+                if let error {
+                    self.handleDisconnection(generation: generation, error: error)
                     return
                 }
-                if let httpResponse = response as? HTTPURLResponse,
-                   (200...299).contains(httpResponse.statusCode) {
-                    print("カメラ登録成功")
-                    completion(true)
-                } else {
-                    print("カメラ登録: 予期しないレスポンス")
-                    completion(false)
-                }
-            }
-        }.resume()
-    }
-
-    // MARK: - WebSocket
-
-    private func openWebSocket() {
-        guard let url = SettingsStore.shared.wsURL else {
-            lastError = "WebSocket URL の構築に失敗しました"
-            return
-        }
-
-        let urlSession = URLSession(configuration: .default)
-        self.session = urlSession
-        let task = urlSession.webSocketTask(with: url)
-        self.webSocketTask = task
-        task.resume()
-
-        isConnecting = true
-        lastError = "接続中..."
-        print("WebSocket 接続試行: \(url)")
-
-        // 接続確認: メッセージ受信を開始し、最初のステータス送信の成功で接続確認
-        receiveMessage()
-        startPingTimer()
-
-        // ステータス送信を試みて接続を確認する
-        let statusPayload = buildStatusPayload()
-        if let data = try? JSONSerialization.data(withJSONObject: statusPayload),
-           let json = String(data: data, encoding: .utf8) {
-            task.send(.string(json)) { [weak self] error in
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    if let error = error {
-                        print("WebSocket 接続失敗: \(error.localizedDescription)")
-                        self.handleDisconnection()
-                        return
-                    }
-                    self.isConnected = true
-                    self.isConnecting = false
-                    self.lastError = nil
-                    self.reconnectAttempts = 0
-                    print("WebSocket 接続確認完了: \(url)")
-
-                    self.startStatusTimer()
-
-                    // 再接続時にタイムラプス状態を同期
-                    if CameraManager.shared.isTimeLapseActive {
-                        self.sendTimeLapseState()
-                    }
-                }
+                self.markConnected(generation: generation)
             }
         }
     }
 
-    private func receiveMessage() {
-        webSocketTask?.receive { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self else { return }
+    private func markConnected(generation: UInt64) {
+        guard connectionGeneration == generation, !isConnected else { return }
+        isConnected = true
+        isConnecting = false
+        lastError = nil
+        reconnectAttempts = 0
+        startStatusTimer(generation: generation)
+        if CameraManager.shared.isTimeLapseActive { sendTimeLapseState() }
+    }
+
+    private func isCurrent(_ task: URLSessionWebSocketTask, generation: UInt64) -> Bool {
+        connectionGeneration == generation && webSocketTask === task && !isIntentionalDisconnect
+    }
+
+    private func receiveMessage(task: URLSessionWebSocketTask, generation: UInt64) {
+        task.receive { [weak self] result in
+            Task { @MainActor in
+                guard let self, self.isCurrent(task, generation: generation) else { return }
                 switch result {
                 case .success(let message):
+                    self.markConnected(generation: generation)
                     self.handleMessage(message)
-                    self.receiveMessage() // 次のメッセージを待機
+                    self.receiveMessage(task: task, generation: generation)
                 case .failure(let error):
-                    print("WebSocket 受信エラー: \(error.localizedDescription)")
-                    self.handleDisconnection()
+                    self.handleDisconnection(generation: generation, error: error)
                 }
             }
         }
     }
 
     private func handleMessage(_ message: URLSessionWebSocketTask.Message) {
+        let data: Data
         switch message {
-        case .string(let text):
-            guard let data = text.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let type = json["type"] as? String else {
-                return
-            }
-
-            if type == "command" {
-                handleCommand(json)
-            } else if type == "active_camera_state" {
-                handleActiveCameraState(json)
-            }
-
-        case .data(let data):
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let type = json["type"] as? String else {
-                return
-            }
-            if type == "command" {
-                handleCommand(json)
-            } else if type == "active_camera_state" {
-                handleActiveCameraState(json)
-            }
-
-        @unknown default:
-            break
+        case .string(let text): guard let value = text.data(using: .utf8) else { return }; data = value
+        case .data(let value): data = value
+        @unknown default: return
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = json["type"] as? String else { return }
+        switch type {
+        case "command": handleCommand(json)
+        case "active_camera_state": handleActiveCameraState(json)
+        case "rtc_subscribe":
+            guard let controlID = json["control_id"] as? String, let sessionID = json["session_id"] as? String else { return }
+            WebRTCManager.shared.subscribe(controlID: controlID, sessionID: sessionID)
+        case "rtc_answer":
+            guard let sessionID = json["session_id"] as? String, let sdp = json["sdp"] as? String else { return }
+            WebRTCManager.shared.answer(sessionID: sessionID, sdp: sdp)
+        case "rtc_ice":
+            guard let sessionID = json["session_id"] as? String, let candidate = json["candidate"] as? [String: Any],
+                  let sdp = candidate["candidate"] as? String else { return }
+            let index = candidate["sdpMLineIndex"] as? Int ?? 0
+            guard let lineIndex = Int32(exactly: index), lineIndex >= 0 else { return }
+            WebRTCManager.shared.ice(sessionID: sessionID, candidate: sdp, sdpMid: candidate["sdpMid"] as? String,
+                                     sdpMLineIndex: lineIndex)
+        case "rtc_unsubscribe":
+            guard let id = json["session_id"] as? String else { return }
+            WebRTCManager.shared.unsubscribe(sessionID: id)
+        case "rtc_control_gone":
+            guard let id = json["control_id"] as? String else { return }
+            WebRTCManager.shared.controlGone(controlID: id)
+        default: break
         }
     }
 
@@ -210,6 +215,8 @@ final class WebSocketManager: ObservableObject {
         guard let command = json["command"] as? String,
               let requestId = json["request_id"] as? String else { return }
 
+        let commandGeneration = connectionGeneration
+
         print("コマンド受信: \(command) (request_id: \(requestId))")
 
         switch command {
@@ -217,29 +224,29 @@ final class WebSocketManager: ObservableObject {
             if !CameraManager.shared.isRecording {
                 CameraManager.shared.selectedMode = .video
                 CameraManager.shared.onRecordingStarted = { [weak self] in
-                    self?.sendCommandResult(requestId: requestId, success: true, message: "recording started")
+                    self?.sendCommandResult(requestId: requestId, generation: commandGeneration, success: true, message: "recording started")
                     CameraManager.shared.onRecordingStarted = nil
                 }
                 CameraManager.shared.toggleRecording()
             } else {
-                sendCommandResult(requestId: requestId, success: true, message: "already recording")
+                sendCommandResult(requestId: requestId, generation: commandGeneration, success: true, message: "already recording")
             }
 
         case "recording_stop":
             if CameraManager.shared.isRecording {
                 CameraManager.shared.onRecordingStopped = { [weak self] in
-                    self?.sendCommandResult(requestId: requestId, success: true, message: "recording stopped")
+                    self?.sendCommandResult(requestId: requestId, generation: commandGeneration, success: true, message: "recording stopped")
                     CameraManager.shared.onRecordingStopped = nil
                 }
                 CameraManager.shared.toggleRecording()
             } else {
-                sendCommandResult(requestId: requestId, success: true, message: "not recording")
+                sendCommandResult(requestId: requestId, generation: commandGeneration, success: true, message: "not recording")
             }
 
         case "take_photo":
             CameraManager.shared.selectedMode = .photo
             CameraManager.shared.onPhotoCaptured = { [weak self] success, message in
-                self?.sendCommandResult(requestId: requestId, success: success, message: message ?? "photo captured")
+                self?.sendCommandResult(requestId: requestId, generation: commandGeneration, success: success, message: message ?? "photo captured")
                 CameraManager.shared.onPhotoCaptured = nil
             }
             CameraManager.shared.capturePhoto()
@@ -249,31 +256,31 @@ final class WebSocketManager: ObservableObject {
             if !CameraManager.shared.isTimeLapseActive {
                 CameraManager.shared.selectedMode = .timeLapse
                 CameraManager.shared.onTimeLapseStarted = { [weak self] in
-                    self?.sendCommandResult(requestId: requestId, success: true, message: "timelapse started")
+                    self?.sendCommandResult(requestId: requestId, generation: commandGeneration, success: true, message: "timelapse started")
                     CameraManager.shared.onTimeLapseStarted = nil
                 }
                 CameraManager.shared.startTimeLapse(interval: interval)
             } else {
-                sendCommandResult(requestId: requestId, success: true, message: "timelapse already running")
+                sendCommandResult(requestId: requestId, generation: commandGeneration, success: true, message: "timelapse already running")
             }
 
         case "timelapse_stop":
             if CameraManager.shared.isTimeLapseActive {
                 CameraManager.shared.onTimeLapseStopped = { [weak self] shotCount in
-                    self?.sendCommandResult(requestId: requestId, success: true, message: "timelapse stopped (\(shotCount) shots)")
+                    self?.sendCommandResult(requestId: requestId, generation: commandGeneration, success: true, message: "timelapse stopped (\(shotCount) shots)")
                     CameraManager.shared.onTimeLapseStopped = nil
                 }
                 CameraManager.shared.stopTimeLapse()
             } else {
-                sendCommandResult(requestId: requestId, success: true, message: "timelapse not running")
+                sendCommandResult(requestId: requestId, generation: commandGeneration, success: true, message: "timelapse not running")
             }
 
         case "timelapse_state_request":
             sendTimeLapseState()
-            sendCommandResult(requestId: requestId, success: true, message: "timelapse state sent")
+            sendCommandResult(requestId: requestId, generation: commandGeneration, success: true, message: "timelapse state sent")
 
         default:
-            sendCommandResult(requestId: requestId, success: false, message: "unknown command: \(command)")
+            sendCommandResult(requestId: requestId, generation: commandGeneration, success: false, message: "unknown command: \(command)")
         }
     }
 
@@ -292,7 +299,7 @@ final class WebSocketManager: ObservableObject {
             "temperature_thermal_state": thermalStateString(ProcessInfo.processInfo.thermalState),
             "platform": "ios",
             "device_model": UIDevice.current.model,
-            "network": "wifi"
+            "network": NetworkMonitor.shared.networkType
         ]
     }
 
@@ -365,7 +372,8 @@ final class WebSocketManager: ObservableObject {
         sendJSON(event)
     }
 
-    private func sendCommandResult(requestId: String, success: Bool, message: String, photoURL: String? = nil) {
+    private func sendCommandResult(requestId: String, generation: UInt64, success: Bool, message: String, photoURL: String? = nil) {
+        guard connectionGeneration == generation else { return }
         var result: [String: Any] = [
             "type": "command_result",
             "request_id": requestId,
@@ -380,35 +388,38 @@ final class WebSocketManager: ObservableObject {
     }
 
     private func sendJSON(_ dict: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: dict),
+        guard isConnected, let task = webSocketTask,
+              let data = try? JSONSerialization.data(withJSONObject: dict),
               let text = String(data: data, encoding: .utf8) else { return }
-
-        webSocketTask?.send(.string(text)) { error in
-            if let error = error {
-                print("WebSocket 送信エラー: \(error.localizedDescription)")
+        let generation = connectionGeneration
+        task.send(.string(text)) { [weak self] error in
+            guard let error else { return }
+            Task { @MainActor in
+                guard let self, self.isCurrent(task, generation: generation) else { return }
+                self.handleDisconnection(generation: generation, error: error)
             }
         }
     }
 
-    // MARK: - タイマー
-
-    private func startStatusTimer() {
+    private func startStatusTimer(generation: UInt64) {
         statusTimer?.invalidate()
         statusTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.sendStatus()
+            Task { @MainActor in
+                guard let self, self.connectionGeneration == generation else { return }
+                self.sendStatus()
             }
         }
     }
 
-    private func startPingTimer() {
+    private func startPingTimer(task: URLSessionWebSocketTask, generation: UInt64) {
         pingTimer?.invalidate()
         pingTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
-            self?.webSocketTask?.sendPing { error in
-                if let error = error {
-                    print("Ping エラー: \(error.localizedDescription)")
-                    DispatchQueue.main.async {
-                        self?.handleDisconnection()
+            Task { @MainActor in
+                guard let self, self.isCurrent(task, generation: generation) else { return }
+                task.sendPing { [weak self] error in
+                    guard let error else { return }
+                    Task { @MainActor in
+                        self?.handleDisconnection(generation: generation, error: error)
                     }
                 }
             }
@@ -424,34 +435,27 @@ final class WebSocketManager: ObservableObject {
         reconnectTimer = nil
     }
 
-    // MARK: - 再接続
-
-    private func handleDisconnection() {
+    private func handleDisconnection(generation: UInt64, error: Error) {
+        guard connectionGeneration == generation, !isIntentionalDisconnect else { return }
+        // Invalidate every pending callback before closing this socket.
+        connectionGeneration &+= 1
         isConnected = false
         isConnecting = false
         isActiveCamera = false
         stopTimers()
-        webSocketTask = nil
-
-        guard !isIntentionalDisconnect else { return }
-
+        releaseConnection()
         reconnectAttempts += 1
-
-        if reconnectAttempts > maxReconnectAttempts {
+        guard reconnectAttempts <= maxReconnectAttempts else {
             lastError = "接続失敗（\(maxReconnectAttempts)回試行済み）。設定から再接続してください。"
-            print("WebSocket 再接続上限到達（\(maxReconnectAttempts)回）")
             return
         }
-
-        lastError = "接続が切断されました。再接続中...（\(reconnectAttempts)/\(maxReconnectAttempts)）"
+        lastError = "接続が切断されました。再接続中…（\(reconnectAttempts)/\(maxReconnectAttempts)）"
         isConnecting = true
-        print("WebSocket 切断。5秒後に再接続を試みます（\(reconnectAttempts)/\(maxReconnectAttempts)）")
-
+        let nextGeneration = connectionGeneration
         reconnectTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: false) { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.openWebSocket()
+            Task { @MainActor in
+                self?.openWebSocket(expectedGeneration: nextGeneration)
             }
         }
     }
-
 }

@@ -9,6 +9,7 @@ enum CameraMode: String, CaseIterable {
 }
 
 protocol CameraCoordinatorProtocol: AnyObject {
+  var captureSession: AVCaptureSession? { get }
   func toggleRecording()
   func capturePhoto()
   func startTimeLapse(interval: TimeInterval)
@@ -35,6 +36,8 @@ class CameraManager: ObservableObject {
   // MARK: - デバイス状態
   @Published var batteryLevel: Float = UIDevice.current.batteryLevel
   @Published var thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
+
+  var captureSession: AVCaptureSession? { coordinator?.captureSession }
 
   weak var coordinator: CameraCoordinatorProtocol?
 

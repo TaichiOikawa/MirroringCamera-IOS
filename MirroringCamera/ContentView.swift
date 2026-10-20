@@ -153,7 +153,7 @@ struct ContentView: View {
             .foregroundColor(batteryColor)
           Text("\(cameraManager.batteryPercent)%")
             .font(.system(size: 10, weight: .medium, design: .monospaced))
-            .foregroundColor(.white)
+            .foregroundColor(batteryColor)
         }
         HStack(spacing: 2) {
           Image(systemName: "thermometer.medium")
@@ -255,7 +255,7 @@ struct ContentView: View {
           Text("\(cameraManager.batteryPercent)%")
         }
         .font(.system(size: 12, weight: .medium))
-        .foregroundColor(.white)
+        .foregroundColor(batteryColor)
 
         HStack(spacing: 4) {
           Image(systemName: "thermometer.medium")
@@ -446,7 +446,7 @@ struct ContentView: View {
 
   private var batteryColor: Color {
     let pct = cameraManager.batteryPercent
-    if pct > 20 { return .green }
+    if pct > 30 { return .green }
     if pct > 10 { return .yellow }
     return .red
   }

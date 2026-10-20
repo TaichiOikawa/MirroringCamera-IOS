@@ -3,98 +3,93 @@ import UIKit
 
 final class SettingsStore: ObservableObject {
     static let shared = SettingsStore()
-
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
 
     private enum Keys {
+        static let connection = "connectionCredentials"
         static let apiBaseURL = "apiBaseURL"
         static let cameraID = "cameraID"
         static let previewInterval = "previewInterval"
         static let apiKey = "apiKey"
     }
 
-    @Published var apiBaseURL: String {
-        didSet { defaults.set(apiBaseURL, forKey: Keys.apiBaseURL) }
+    private struct Connection {
+        var apiBaseURL: String
+        var cameraID: String
+        var apiKey: String
+        var dictionary: [String: String] {
+            [Keys.apiBaseURL: apiBaseURL, Keys.cameraID: cameraID, Keys.apiKey: apiKey]
+        }
     }
 
-    @Published var cameraID: String {
-        didSet { defaults.set(cameraID, forKey: Keys.cameraID) }
+    // One publication and one persisted value for a complete set of credentials.
+    @Published private var connection: Connection {
+        didSet { defaults.set(connection.dictionary, forKey: Keys.connection) }
     }
 
-    /// プレビュー送信間隔（秒）
+    var apiBaseURL: String {
+        get { connection.apiBaseURL }
+        set { connection.apiBaseURL = newValue }
+    }
+    var cameraID: String {
+        get { connection.cameraID }
+        set { connection.cameraID = newValue }
+    }
+    var apiKey: String {
+        get { connection.apiKey }
+        set { connection.apiKey = newValue }
+    }
+
     @Published var previewInterval: TimeInterval {
         didSet { defaults.set(previewInterval, forKey: Keys.previewInterval) }
     }
 
-    /// Camera API Key（認証用）
-    @Published var apiKey: String {
-        didSet { defaults.set(apiKey, forKey: Keys.apiKey) }
-    }
-
-    /// 選択肢として表示する間隔一覧
     static let previewIntervalOptions: [(TimeInterval, String)] = [
-        (0.5, "0.5秒"),
-        (1.0, "1秒"),
-        (1.5, "1.5秒"),
-        (2.0, "2秒")
+        (0.5, "0.5秒"), (1.0, "1秒"), (1.5, "1.5秒"), (2.0, "2秒")
     ]
 
     var isConfigured: Bool {
-        !apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        restBaseURL != nil && !cameraID.isEmpty && !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    /// WebSocket 接続用 URL
     var wsURL: URL? {
-        let base = apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !base.isEmpty else { return nil }
-        // http -> ws, https -> wss
-        var wsBase = base
-        if wsBase.hasPrefix("https://") {
-            wsBase = "wss://" + wsBase.dropFirst("https://".count)
-        } else if wsBase.hasPrefix("http://") {
-            wsBase = "ws://" + wsBase.dropFirst("http://".count)
-        } else {
-            wsBase = "ws://" + wsBase
-        }
-        // 末尾スラッシュを除去
-        if wsBase.hasSuffix("/") {
-            wsBase = String(wsBase.dropLast())
-        }
+        guard let base = restBaseURL,
+              var components = URLComponents(url: base, resolvingAgainstBaseURL: false) else { return nil }
         let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty else { return nil }
-        return URL(string: "\(wsBase)/ws/camera/\(cameraID)?api_key=\(key)")
+        guard !key.isEmpty, !cameraID.isEmpty else { return nil }
+        components.scheme = base.scheme == "https" ? "wss" : "ws"
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove(charactersIn: "/%?#")
+        guard let id = cameraID.addingPercentEncoding(withAllowedCharacters: allowed) else { return nil }
+        components.percentEncodedPath += "/ws/camera/" + id
+        components.queryItems = [URLQueryItem(name: "api_key", value: key)]
+        // Many servers decode queries as form data; a literal '+' must stay a plus.
+        components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
+        return components.url
     }
 
-    /// REST API ベース URL
-    var restBaseURL: URL? {
-        let base = apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !base.isEmpty else { return nil }
-        var urlString = base
-        if urlString.hasSuffix("/") {
-            urlString = String(urlString.dropLast())
-        }
-        // scheme が無ければ http:// を付与
-        if !urlString.hasPrefix("http://") && !urlString.hasPrefix("https://") {
-            urlString = "http://" + urlString
-        }
-        return URL(string: urlString)
+    var restBaseURL: URL? { PairingPayload.normalizedServerURL(apiBaseURL) }
+
+    func applyPairing(_ credentials: PairingCredentials) {
+        connection = Connection(apiBaseURL: credentials.serverURL.absoluteString,
+                                cameraID: credentials.cameraID, apiKey: credentials.apiKey)
     }
 
-    private init() {
-        self.apiBaseURL = defaults.string(forKey: Keys.apiBaseURL) ?? ""
-        self.apiKey = defaults.string(forKey: Keys.apiKey) ?? ""
-        self.previewInterval = defaults.object(forKey: Keys.previewInterval) as? TimeInterval ?? 1.0
-
-        if let savedID = defaults.string(forKey: Keys.cameraID), !savedID.isEmpty {
-            self.cameraID = savedID
-        } else {
+    // Injectable defaults allow migration/persistence tests without touching user settings.
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        let saved = defaults.dictionary(forKey: Keys.connection) as? [String: String]
+        let savedID = saved?[Keys.cameraID] ?? defaults.string(forKey: Keys.cameraID)
+        let cameraID: String
+        if let savedID, !savedID.isEmpty { cameraID = savedID }
+        else {
             let uuid = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
-            // 先頭8文字を使って読みやすい ID にする
-            let shortID = String(uuid.prefix(8)).lowercased()
-            let generatedID = "iphone-\(shortID)"
-            self.cameraID = generatedID
-            defaults.set(generatedID, forKey: Keys.cameraID)
+            cameraID = "iphone-" + String(uuid.prefix(8)).lowercased()
         }
+        connection = Connection(apiBaseURL: saved?[Keys.apiBaseURL] ?? defaults.string(forKey: Keys.apiBaseURL) ?? "",
+                                cameraID: cameraID,
+                                apiKey: saved?[Keys.apiKey] ?? defaults.string(forKey: Keys.apiKey) ?? "")
+        previewInterval = defaults.object(forKey: Keys.previewInterval) as? TimeInterval ?? 1
+        defaults.set(connection.dictionary, forKey: Keys.connection)
     }
 }
