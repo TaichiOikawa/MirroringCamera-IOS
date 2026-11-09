@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import UIKit
+import WebRTC
 
 @MainActor
 final class ExternalDisplayStore: ObservableObject {
@@ -162,7 +163,19 @@ private class VideoOutputDelegate: NSObject, AVCaptureVideoDataOutputSampleBuffe
             layer.enqueue(sampleBuffer)
         }
 
-        // WebSocket プレビュー送信（設定された間隔）
+        // WebRTC プレビュー配信（視聴者が実際に接続中の時のみ・フレームレートそのまま）
+        // docs/api.md §2-4。コネクションの videoRotationAngle で既に回転済みのため rotation は ._0。
+        // フォールバック中（接続ゼロ）はエンコードを止めて発熱を抑える。
+        if WebRTCManager.shared.hasConnectedSessions,
+           let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            let timeStampNs = Int64(CMTimeGetSeconds(pts) * 1_000_000_000)
+            WebRTCManager.shared.pushFrame(pixelBuffer: pixelBuffer, rotation: ._0, timeStampNs: timeStampNs)
+        }
+
+        // WebSocket プレビュー送信（JPEG フォールバック）。WebRTC が確立できない時のみ、
+        // 設定された間隔で送る。docs/api.md `preview`。
+        guard WebRTCManager.shared.isFallbackActive else { return }
         let now = Date()
         let interval = SettingsStore.shared.previewInterval
         guard now.timeIntervalSince(lastPreviewSentAt) >= interval else { return }

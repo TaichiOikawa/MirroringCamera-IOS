@@ -22,6 +22,27 @@ final class WebSocketManager: ObservableObject {
 
     private init() {
         UIDevice.current.isBatteryMonitoringEnabled = true
+        wireWebRTC()
+    }
+
+    /// WebRTCManager のシグナリング送信コールバックを WebSocket 送信へ配線する。
+    /// コールバックは WebRTC のスレッドから届くため、メインアクターへホップしてから送信する。
+    private func wireWebRTC() {
+        WebRTCManager.shared.onLocalOffer = { controlId, sessionId, sdp in
+            Task { @MainActor in
+                WebSocketManager.shared.sendRtcOffer(controlId: controlId, sessionId: sessionId, sdp: sdp)
+            }
+        }
+        WebRTCManager.shared.onLocalIce = { controlId, sessionId, candidate, sdpMid, sdpMLineIndex in
+            Task { @MainActor in
+                WebSocketManager.shared.sendRtcIce(controlId: controlId, sessionId: sessionId, candidate: candidate, sdpMid: sdpMid, sdpMLineIndex: sdpMLineIndex)
+            }
+        }
+        WebRTCManager.shared.onLocalClose = { controlId, sessionId in
+            Task { @MainActor in
+                WebSocketManager.shared.sendRtcClose(controlId: controlId, sessionId: sessionId)
+            }
+        }
     }
 
     // MARK: - 接続管理
@@ -48,6 +69,7 @@ final class WebSocketManager: ObservableObject {
     func disconnect() {
         isIntentionalDisconnect = true
         stopTimers()
+        WebRTCManager.shared.closeAll()
         webSocketTask?.cancel(with: .normalClosure, reason: nil)
         webSocketTask = nil
         isConnected = false
@@ -178,6 +200,8 @@ final class WebSocketManager: ObservableObject {
                 handleCommand(json)
             } else if type == "active_camera_state" {
                 handleActiveCameraState(json)
+            } else if type.hasPrefix("rtc_") {
+                handleRtcMessage(type: type, json: json)
             }
 
         case .data(let data):
@@ -189,6 +213,8 @@ final class WebSocketManager: ObservableObject {
                 handleCommand(json)
             } else if type == "active_camera_state" {
                 handleActiveCameraState(json)
+            } else if type.hasPrefix("rtc_") {
+                handleRtcMessage(type: type, json: json)
             }
 
         @unknown default:
@@ -204,6 +230,74 @@ final class WebSocketManager: ObservableObject {
         let activeCameraId = json["active_camera_id"] as? String ?? "none"
         let atemConnected = json["atem_connected"] as? Bool ?? false
         print("アクティブ状態受信: is_active=\(isActive), active_camera_id=\(activeCameraId), atem_connected=\(atemConnected)")
+    }
+
+    // MARK: - WebRTC シグナリング受信（サーバー -> iPhone, docs/api.md §2-4）
+
+    private func handleRtcMessage(type: String, json: [String: Any]) {
+        switch type {
+        case "rtc_subscribe":
+            guard let controlId = json["control_id"] as? String,
+                  let sessionId = json["session_id"] as? String else { return }
+            WebRTCManager.shared.onSubscribe(controlId: controlId, sessionId: sessionId)
+
+        case "rtc_answer":
+            guard let sessionId = json["session_id"] as? String,
+                  let sdp = json["sdp"] as? String else { return }
+            WebRTCManager.shared.onRemoteAnswer(sessionId: sessionId, sdp: sdp)
+
+        case "rtc_ice":
+            guard let sessionId = json["session_id"] as? String,
+                  let cand = json["candidate"] as? [String: Any],
+                  let candidate = cand["candidate"] as? String else { return }
+            let sdpMid = cand["sdpMid"] as? String
+            let sdpMLineIndex = Int32((cand["sdpMLineIndex"] as? Int) ?? 0)
+            WebRTCManager.shared.onRemoteIce(sessionId: sessionId, candidate: candidate, sdpMid: sdpMid, sdpMLineIndex: sdpMLineIndex)
+
+        case "rtc_unsubscribe":
+            guard let sessionId = json["session_id"] as? String else { return }
+            WebRTCManager.shared.onUnsubscribe(sessionId: sessionId)
+
+        case "rtc_control_gone":
+            guard let controlId = json["control_id"] as? String else { return }
+            WebRTCManager.shared.onControlGone(controlId: controlId)
+
+        default:
+            break
+        }
+    }
+
+    // MARK: - WebRTC シグナリング送信（iPhone -> サーバー, docs/api.md §2-4）
+
+    func sendRtcOffer(controlId: String, sessionId: String, sdp: String) {
+        sendJSON([
+            "type": "rtc_offer",
+            "control_id": controlId,
+            "session_id": sessionId,
+            "sdp": sdp
+        ])
+    }
+
+    func sendRtcIce(controlId: String, sessionId: String, candidate: String, sdpMid: String?, sdpMLineIndex: Int32) {
+        let cand: [String: Any] = [
+            "candidate": candidate,
+            "sdpMLineIndex": Int(sdpMLineIndex),
+            "sdpMid": sdpMid ?? NSNull()
+        ]
+        sendJSON([
+            "type": "rtc_ice",
+            "control_id": controlId,
+            "session_id": sessionId,
+            "candidate": cand
+        ])
+    }
+
+    func sendRtcClose(controlId: String, sessionId: String) {
+        sendJSON([
+            "type": "rtc_close",
+            "control_id": controlId,
+            "session_id": sessionId
+        ])
     }
 
     private func handleCommand(_ json: [String: Any]) {
@@ -431,6 +525,7 @@ final class WebSocketManager: ObservableObject {
         isConnecting = false
         isActiveCamera = false
         stopTimers()
+        WebRTCManager.shared.closeAll()
         webSocketTask = nil
 
         guard !isIntentionalDisconnect else { return }

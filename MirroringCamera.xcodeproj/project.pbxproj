@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		70AA00012E62000000D50289 /* WebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = 70AA00022E62000000D50289 /* WebRTC */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		706F1A202E61F6DC00D50289 /* MirroringCamera.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MirroringCamera.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -36,6 +40,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				70AA00012E62000000D50289 /* WebRTC in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -78,6 +83,7 @@
 			);
 			name = MirroringCamera;
 			packageProductDependencies = (
+				70AA00022E62000000D50289 /* WebRTC */,
 			);
 			productName = MirroringCamera;
 			productReference = 706F1A202E61F6DC00D50289 /* MirroringCamera.app */;
@@ -107,6 +113,9 @@
 			);
 			mainGroup = 706F1A172E61F6DC00D50289;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				70AA00032E62000000D50289 /* XCRemoteSwiftPackageReference "WebRTC" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 706F1A212E61F6DC00D50289 /* Products */;
 			projectDirPath = "";
@@ -355,6 +364,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		70AA00032E62000000D50289 /* XCRemoteSwiftPackageReference "WebRTC" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/stasel/WebRTC";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 149.0.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		70AA00022E62000000D50289 /* WebRTC */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 70AA00032E62000000D50289 /* XCRemoteSwiftPackageReference "WebRTC" */;
+			productName = WebRTC;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 706F1A182E61F6DC00D50289 /* Project object */;
 }
